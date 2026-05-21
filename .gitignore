@@ -1,0 +1,31 @@
+# Virtual environments
+venv/
+.venv/
+
+# Python caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Local data and generated artifacts
+data/
+artifacts/
+checkpoints/
+tensorboard_log/
+brain/
+tradingbot-brain/
+trade_history_output.csv
+
+# Local models and plots
+*.zip
+Figure_*.png
+
+# Local installer/archive leftovers
+*.exe
+*.7z
+*.tar
+*.gz
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
