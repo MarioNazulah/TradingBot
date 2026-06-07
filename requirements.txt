@@ -1,8 +1,15 @@
-gymnasium==1.2.3
-matplotlib==3.10.9
+# Locked pins — DO NOT edit by hand. Edit requirements.in and recompile.
+# All versions verified as released on PyPI with Python 3.13 (cp313) wheels.
+# torch bumped 2.5.1 -> 2.7.1: 2.5.x ships no cp313 wheel, so it was
+# uninstallable on Python 3.13 (the ceiling stays <2.8 per requirements.in).
+gymnasium==1.0.0
+matplotlib==3.9.4
 numpy==2.2.6
-pandas==3.0.2
-stable-baselines3==2.8.0
+optuna==4.1.0
+pandas==2.2.3
+sb3-contrib==2.5.0
+scipy==1.15.3
+stable-baselines3==2.5.0
 ta==0.11.0
-tensorboard==2.20.0
-torch==2.11.0
+tensorboard==2.18.0
+torch==2.7.1

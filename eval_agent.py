@@ -5,13 +5,20 @@ from dataclasses import replace
 from pathlib import Path
 
 import matplotlib.pyplot as plt
-from stable_baselines3 import PPO
-from stable_baselines3.common.vec_env import DummyVecEnv
+from sb3_contrib import MaskablePPO
 
-from config import build_bot_config, ensure_output_dirs, load_run_config, model_config_path_for, split_train_val_test
+from config import (
+    assert_feature_schema,
+    build_bot_config,
+    ensure_output_dirs,
+    load_feature_columns,
+    load_run_config,
+    model_config_path_for,
+    split_train_val_test,
+)
+from env_factory import make_eval_env
 from evaluation import run_one_episode, save_trade_history
 from indicators import load_and_preprocess_data
-from trading_env import ForexTradingEnv
 
 
 def parse_args():
@@ -21,28 +28,6 @@ def parse_args():
     parser.add_argument("--output-csv", type=str, help="Path for closed trade history CSV output.")
     parser.add_argument("--no-plot", action="store_true", help="Skip matplotlib plots.")
     return parser.parse_args()
-
-
-def make_env(df, feature_cols, config):
-    env_cfg = config.env
-    return ForexTradingEnv(
-        df=df,
-        window_size=env_cfg.window_size,
-        sl_options=env_cfg.sl_options,
-        tp_options=env_cfg.tp_options,
-        spread_pips=env_cfg.spread_pips,
-        commission_pips=env_cfg.commission_pips,
-        max_slippage_pips=env_cfg.max_slippage_pips,
-        random_start=False,
-        min_episode_steps=env_cfg.min_episode_steps,
-        episode_max_steps=None,
-        feature_columns=feature_cols,
-        hold_reward_weight=env_cfg.hold_reward_weight,
-        open_penalty_pips=env_cfg.open_penalty_pips,
-        time_penalty_pips=env_cfg.time_penalty_pips,
-        unrealized_delta_weight=env_cfg.unrealized_delta_weight,
-        allow_flip=env_cfg.allow_flip,
-    )
 
 
 def main():
@@ -73,14 +58,18 @@ def main():
     df, feature_cols = load_and_preprocess_data(config.data.dataset_path)
     _, _, test_df = split_train_val_test(df, config.data.train_ratio, config.data.val_ratio)
 
+    # Phase 2.4: fail-fast if the live indicator schema drifted from the model's.
+    assert_feature_schema(load_feature_columns(config_path), feature_cols)
+
     print(f"Model path    : {model_path}")
     print(f"Dataset path  : {config.data.dataset_path}")
     print(f"Timezone      : {config.data.timestamp_timezone}")
     print(f"Test bars     : {len(test_df)}")
-    print(f"Action space  : {len(config.env.sl_options) * len(config.env.tp_options) * 2 + 2}")
+    print(f"Action mode   : {config.env.action_space_mode}")
 
-    vec_test_env = DummyVecEnv([lambda: make_env(test_df, feature_cols, config)])
-    model = PPO.load(str(model_path), env=vec_test_env)
+    # Reuse the training-time observation normalization if its stats are saved.
+    vec_test_env = make_eval_env(test_df, feature_cols, config, config.output.vecnormalize_path)
+    model = MaskablePPO.load(str(model_path), env=vec_test_env)
 
     equity_curve, _, closed_trades = run_one_episode(model, vec_test_env, deterministic=True)
 

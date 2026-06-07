@@ -60,6 +60,10 @@ def make_env(df, **kwargs):
         open_penalty_pips=0.0,
         time_penalty_pips=0.0,
         unrealized_delta_weight=0.0,
+        # These legacy tests drive the env with integer actions / action_map,
+        # so they exercise the Discrete path explicitly. Phase 1 (MultiDiscrete,
+        # costs, masking) is covered in test_env_phase1.py.
+        action_space_mode="discrete",
     )
     defaults.update(kwargs)
     return ForexTradingEnv(df=df, **defaults)
@@ -405,6 +409,118 @@ def test_hold_reward_only_on_new_highs():
     # All rewards during pullback should be <= 0 (no hold bonus, only time penalty if any)
     for r in rewards_during_pullback:
         assert r <= 0.001, f"Got hold reward {r} during pullback — high water mark not working"
+
+
+# -----------------------------------------------
+# TEST 9 (Phase 0.1): realized loss on SL hit is capped at risk_per_trade
+# across random spread/slippage/SL configurations.
+# -----------------------------------------------
+
+def test_risk_per_trade_capped():
+    pip = 0.0001
+    start = 1.1000
+    rng = np.random.default_rng(seed=12345)
+    risk_per_trade = 0.01
+    n_scenarios = 200
+
+    for scenario in range(n_scenarios):
+        sl_pips = int(rng.integers(10, 60))
+        spread_pips = float(rng.uniform(0.0, 3.0))
+        max_slip = float(rng.uniform(0.0, 1.5))
+
+        n = 80
+        prices = np.full(n, start, dtype=np.float64)
+        # Force a big down move that triggers SL on the bar after open.
+        sl_drop = (sl_pips + spread_pips + max_slip + 50) * pip
+        df = pd.DataFrame({
+            "Open": prices,
+            "High": prices + 2 * pip,
+            "Low":  np.where(np.arange(n) == 12, start - sl_drop, prices - 2 * pip),
+            "Close": prices,
+            "Volume": np.ones(n),
+            "rsi_14": np.full(n, 50.0),
+            "atr_14": np.full(n, 10 * pip),
+        })
+
+        env = make_env(
+            df,
+            spread_pips=spread_pips,
+            commission_pips=0.0,
+            max_slippage_pips=max_slip,
+            open_penalty_pips=0.0,
+            time_penalty_pips=0.0,
+            sl_options=[sl_pips],
+            tp_options=[sl_pips * 2],
+        )
+        env.reset(seed=scenario)
+        equity_at_open = env.equity_usd
+
+        open_long = next(
+            i for i, (a, d, sl, tp) in enumerate(env.action_map)
+            if a == "OPEN" and d == 1 and sl == sl_pips
+        )
+        # Step once first so SL check fires on bar 12.
+        env.step(0)
+        env.step(open_long)
+        env.step(0)  # next-bar SL check
+
+        assert env.position == 0, f"scenario {scenario}: SL should have fired"
+        realized_loss = equity_at_open - env.equity_usd
+        cap = equity_at_open * risk_per_trade * 1.01  # 1% tolerance
+        assert realized_loss <= cap, (
+            f"scenario {scenario}: loss ${realized_loss:.4f} exceeds cap "
+            f"${cap:.4f} (sl={sl_pips}, spread={spread_pips:.2f}, slip={max_slip:.2f})"
+        )
+
+
+# -----------------------------------------------
+# TEST 10 (Phase 0.1): usd_per_pip invariant holds through trade lifecycle.
+# -----------------------------------------------
+
+def test_usd_per_pip_invariant():
+    df = make_trending_df(n=200)
+    env = make_env(df, spread_pips=1.0, max_slippage_pips=0.5)
+    env.reset(seed=0)
+
+    open_long = next(
+        i for i, (a, d, sl, tp) in enumerate(env.action_map)
+        if a == "OPEN" and d == 1 and sl == 20
+    )
+    env.step(open_long)
+    assert abs(env.usd_per_pip - env.pip_value * env.lot_size_units) < 1e-9
+
+
+# -----------------------------------------------
+# TEST 11 (Phase 0.4): same seed -> identical episodes.
+# Two envs constructed with the same seed and fed the same actions must
+# produce byte-identical observations and rewards (proves slippage and
+# random_start use the env RNG, not global np.random).
+# -----------------------------------------------
+
+def test_seeded_determinism():
+    df = make_trending_df(n=400)
+
+    def build():
+        return make_env(
+            df,
+            max_slippage_pips=0.5,
+            random_start=True,
+            min_episode_steps=50,
+            spread_pips=1.0,
+        )
+
+    actions = [0, 0, 2, 0, 0, 1, 0, 0]  # HOLD, HOLD, some OPEN, HOLD..., CLOSE, ...
+
+    e1 = build(); o1, _ = e1.reset(seed=7)
+    e2 = build(); o2, _ = e2.reset(seed=7)
+    assert np.array_equal(o1, o2), "reset with same seed should give identical obs"
+    assert e1.current_step == e2.current_step, "random_start differs across envs"
+
+    for a in actions:
+        s1 = e1.step(a)
+        s2 = e2.step(a)
+        assert np.array_equal(s1[0], s2[0]), "obs diverged"
+        assert s1[1] == s2[1], f"reward diverged: {s1[1]} vs {s2[1]}"
 
 
 if __name__ == "__main__":

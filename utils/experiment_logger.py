@@ -7,11 +7,12 @@ def log_experiment_to_obsidian(config: dict, results: dict, notes: str = "", vau
     vault_path = Path(vault_path)
     os.makedirs(vault_path, exist_ok=True)
 
-    run_id = datetime.now().strftime("%Y%m%d_%H%M")
+    now = datetime.now()
+    run_id = now.strftime("%Y%m%d_%H%M")
     filename = vault_path / f"{run_id}.md"
 
     content = f"""---
-date: {datetime.now().strftime("%Y-%m-%d")}
+date: {now.strftime("%Y-%m-%d")}
 run_id: {run_id}
 status: done
 ---

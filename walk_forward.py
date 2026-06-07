@@ -5,15 +5,14 @@ from dataclasses import replace
 
 import matplotlib.pyplot as plt
 import numpy as np
-from stable_baselines3 import PPO
+from sb3_contrib import MaskablePPO
 from stable_baselines3.common.callbacks import CheckpointCallback
 from stable_baselines3.common.utils import set_random_seed
-from stable_baselines3.common.vec_env import DummyVecEnv
 
 from config import PROJECT_ROOT, build_bot_config, ensure_output_dirs, save_json
-from evaluation import compute_metrics, run_one_episode
+from env_factory import make_eval_env, make_train_env
+from evaluation import compute_metrics, run_one_episode, score_model
 from indicators import load_and_preprocess_data
-from trading_env import ForexTradingEnv
 from utils.experiment_logger import log_experiment_to_obsidian
 
 
@@ -24,49 +23,42 @@ def parse_args():
     parser.add_argument("--timesteps", type=int, help="Override total PPO training timesteps per fold.")
     parser.add_argument("--seed", type=int, help="Override the base random seed.")
     parser.add_argument("--folds", type=int, default=5, help="Number of walk-forward folds.")
-    parser.add_argument("--enable-obsidian-log", action="store_true", help="Write aggregate experiment notes into the local Obsidian vault.")
-    parser.add_argument("--no-plot", action="store_true", help="Skip matplotlib plots.")
-    return parser.parse_args()
-
-
-def make_env(df, feature_cols, config, random_start: bool, episode_max_steps: int | None):
-    env_cfg = config.env
-    return ForexTradingEnv(
-        df=df,
-        window_size=env_cfg.window_size,
-        sl_options=env_cfg.sl_options,
-        tp_options=env_cfg.tp_options,
-        spread_pips=env_cfg.spread_pips,
-        commission_pips=env_cfg.commission_pips,
-        max_slippage_pips=env_cfg.max_slippage_pips,
-        random_start=random_start,
-        min_episode_steps=env_cfg.min_episode_steps,
-        episode_max_steps=episode_max_steps,
-        feature_columns=feature_cols,
-        hold_reward_weight=env_cfg.hold_reward_weight,
-        open_penalty_pips=env_cfg.open_penalty_pips,
-        time_penalty_pips=env_cfg.time_penalty_pips,
-        unrealized_delta_weight=env_cfg.unrealized_delta_weight,
-        allow_flip=env_cfg.allow_flip,
+    parser.add_argument(
+        "--enable-obsidian-log",
+        action="store_true",
+        dest="enable_obsidian_log",
+        help="Write aggregate experiment notes into the local experiments folder.",
     )
+    parser.add_argument(
+        "--no-experiment-log",
+        action="store_false",
+        dest="enable_obsidian_log",
+        help="Disable automatic markdown experiment logging for this run.",
+    )
+    parser.add_argument("--no-plot", action="store_true", help="Skip matplotlib plots.")
+    parser.set_defaults(enable_obsidian_log=True)
+    return parser.parse_args()
 
 
 def get_walk_forward_splits(df, n_folds=5, val_ratio=0.15, test_ratio=0.15):
     n = len(df)
-    val_size = int(n * val_ratio)
-    test_size = int(n * test_ratio)
-    step = max(1, (n - val_size - test_size) // n_folds)
+    # Size val/test windows relative to each fold's TRAINING segment, not the
+    # whole dataset (review #15). Otherwise early folds get val/test windows
+    # larger than the data they trained on.
+    step = max(1, n // (n_folds + 2))
 
     splits = []
     for fold in range(n_folds):
         train_end = step * (fold + 1)
+        val_size = max(1, int(train_end * val_ratio))
+        test_size = max(1, int(train_end * test_ratio))
         val_start = train_end
         test_start = val_start + val_size
         test_end = test_start + test_size
 
         if test_end > n:
             break
-        if min(train_end, val_size, test_size) <= 0:
+        if train_end <= 0:
             continue
 
         splits.append({
@@ -111,17 +103,11 @@ def run_walk_forward(df, feature_cols, config, n_folds=5, plot_results: bool = T
         fold_config = replace(config, output=replace(config.output, root_dir=fold_root))
         ensure_output_dirs(fold_config)
 
-        train_vec = DummyVecEnv([
-            lambda: make_env(train_df, feature_cols, fold_config, True, fold_config.env.train_episode_max_steps)
-        ])
-        val_vec = DummyVecEnv([
-            lambda: make_env(val_df, feature_cols, fold_config, False, None)
-        ])
-        test_vec = DummyVecEnv([
-            lambda: make_env(test_df, feature_cols, fold_config, False, None)
-        ])
+        # env_factory binds df by argument (no loop-variable closure, review #9)
+        # and wraps train in VecNormalize (review #14).
+        train_vec = make_train_env(train_df, feature_cols, fold_config, fold_config.env.train_episode_max_steps)
 
-        model = PPO(
+        model = MaskablePPO(
             policy="MlpPolicy",
             env=train_vec,
             verbose=0,
@@ -142,7 +128,15 @@ def run_walk_forward(df, feature_cols, config, n_folds=5, plot_results: bool = T
 
         model.learn(total_timesteps=fold_config.training.total_timesteps, callback=checkpoint_callback)
 
-        _, best_val_equity, _ = run_one_episode(model, val_vec)
+        # Save normalization stats; build eval envs that reuse them.
+        train_vec.save(str(fold_config.output.vecnormalize_path))
+        bar_hours = fold_config.env.bar_hours
+        stats = fold_config.output.vecnormalize_path
+        val_vec = make_eval_env(val_df, feature_cols, fold_config, stats)
+        test_vec = make_eval_env(test_df, feature_cols, fold_config, stats)
+
+        # Select by Sharpe, not final equity (review #10).
+        best_score, best_val_equity, _, _ = score_model(model, val_vec, bar_hours)
         best_model = model
         best_path = None
 
@@ -153,22 +147,23 @@ def run_walk_forward(df, feature_cols, config, n_folds=5, plot_results: bool = T
 
         for checkpoint in checkpoints:
             try:
-                candidate = PPO.load(str(checkpoint), env=val_vec)
-                _, final_equity, _ = run_one_episode(candidate, val_vec)
-                if final_equity > best_val_equity:
+                candidate = MaskablePPO.load(str(checkpoint), env=val_vec)
+                sharpe, final_equity, _, _ = score_model(candidate, val_vec, bar_hours)
+                if sharpe > best_score:
+                    best_score = sharpe
                     best_val_equity = final_equity
                     best_path = checkpoint
             except Exception as exc:
                 print(f"[Skip] {checkpoint.name}: {exc}")
 
         if best_path is not None:
-            best_model = PPO.load(str(best_path), env=train_vec)
-            print(f"Fold {fold}: best checkpoint {best_path} (validation equity: {best_val_equity:.2f})")
+            best_model = MaskablePPO.load(str(best_path), env=train_vec)
+            print(f"Fold {fold}: best checkpoint {best_path} (validation Sharpe: {best_score:.3f})")
         else:
-            print(f"Fold {fold}: using last model (validation equity: {best_val_equity:.2f})")
+            print(f"Fold {fold}: using last model (validation Sharpe: {best_score:.3f})")
 
         equity_curve, final_equity, closed_trades = run_one_episode(best_model, test_vec)
-        metrics = compute_metrics(closed_trades, equity_curve)
+        metrics = compute_metrics(closed_trades, equity_curve, bar_hours=bar_hours)
         metrics["fold"] = fold
         metrics["final_equity"] = round(final_equity, 2)
         metrics["best_validation_equity"] = round(best_val_equity, 2)
@@ -195,14 +190,29 @@ def run_walk_forward(df, feature_cols, config, n_folds=5, plot_results: bool = T
         "final_equity",
         "best_validation_equity",
     ]
+    # Trade counts are integers — averaging them as floats and rounding to
+    # 3 decimals is meaningless. Report sum + per-fold spread instead.
+    INT_KEYS = {"n_trades"}
 
     print(f"\n{'=' * 50}")
     print("WALK-FORWARD AGGREGATE RESULTS")
     print(f"{'=' * 50}")
     for key in metric_keys:
         values = [fold_metrics[key] for fold_metrics in all_fold_metrics]
-        aggregate[key] = round(float(np.mean(values)), 3)
-        print(f"  {key}: mean={aggregate[key]:.3f} per-fold={values}")
+        if key in INT_KEYS:
+            int_values = [int(v) for v in values]
+            aggregate[key] = {
+                "sum": int(sum(int_values)),
+                "min": int(min(int_values)),
+                "max": int(max(int_values)),
+                "per_fold": int_values,
+            }
+            print(f"  {key}: sum={aggregate[key]['sum']} "
+                  f"[min={aggregate[key]['min']}, max={aggregate[key]['max']}] "
+                  f"per-fold={int_values}")
+        else:
+            aggregate[key] = round(float(np.mean(values)), 3)
+            print(f"  {key}: mean={aggregate[key]:.3f} per-fold={values}")
 
     save_json(
         {
